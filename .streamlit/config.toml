@@ -13,7 +13,7 @@ showSidebarNavigation = false
 gatherUsageStats = false
 
 [theme]
-base = "light"
+base = "dark"
 primaryColor = "#E5484D"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F4F6F8"
