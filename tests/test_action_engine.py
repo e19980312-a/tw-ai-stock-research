@@ -150,6 +150,20 @@ class ResearchEngineTests(unittest.TestCase):
                 output = " ".join(result.as_dict().values())
                 self.assertFalse(any(term in output for term in forbidden))
 
+    def test_low_confidence_cannot_output_active_candidate(self):
+        result = decide_research(
+            total_score=90,
+            valuation_score=18,
+            price_risk_score=9,
+            ai_relevance="高",
+            confidence_level="低",
+        )
+        self.assertIn(
+            result.research_decision,
+            {"續列觀察", "僅追蹤不投入"},
+        )
+        self.assertNotEqual(result.research_signal, "consider")
+
 
 if __name__ == "__main__":
     unittest.main()

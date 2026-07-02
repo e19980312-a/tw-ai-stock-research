@@ -15,6 +15,7 @@ REQUIRED_ROOT_FILES = {
     "action_engine.py",
     "stocks.csv",
     "decision_summary.csv",
+    "research_candidates.csv",
     "watchlist.csv",
 }
 
@@ -47,6 +48,7 @@ class CommunityCloudDeploymentTests(unittest.TestCase):
         csv_paths = (
             app.SUMMARY_PATH,
             app.SUGGESTED_PATH,
+            app.CANDIDATES_PATH,
             app.STOCKS_PATH,
             app.WATCHLIST_PATH,
             app.APPLY_LOG_PATH,

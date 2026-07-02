@@ -49,6 +49,53 @@ def temporary_project_watchlist(rows):
         app_module.clear_data_caches()
 
 
+def candidate_record(stock_id="2317", stock_name="鴻海"):
+    return {
+        "generated_at": "2026-07-03T10:00:00+08:00",
+        "stock_id": stock_id,
+        "stock_name": stock_name,
+        "market": "TWSE",
+        "industry_position": "AI 伺服器、ODM 與雲端資料中心供應鏈",
+        "ai_relevance": "高",
+        "is_bottleneck": "部分",
+        "industry_score": 21,
+        "growth_score": 20,
+        "ai_score": 18,
+        "valuation_score": 14,
+        "price_risk_score": 6,
+        "total_score": 79,
+        "research_decision": "續列觀察",
+        "research_signal": "watch",
+        "signal_strength": "中",
+        "research_reason": "公司條件不差，但等待條件改善",
+        "risk_notes": "客戶集中與資本支出循環風險",
+        "research_note": "初步研究資料，需人工確認",
+        "confidence_level": "中",
+        "source_urls": "https://example.com",
+    }
+
+
+@contextmanager
+def temporary_project_candidates(rows):
+    path = PROJECT_DIR / "research_candidates.csv"
+    original = path.read_bytes() if path.exists() else None
+    pd.DataFrame(rows, columns=app_module.CANDIDATE_COLUMNS).to_csv(
+        path,
+        index=False,
+        encoding="utf-8-sig",
+        lineterminator="\n",
+    )
+    app_module.clear_data_caches()
+    try:
+        yield
+    finally:
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(original)
+        app_module.clear_data_caches()
+
+
 @contextmanager
 def temporary_public_mode(enabled):
     original_mode = app_module.PUBLIC_MODE
@@ -76,7 +123,7 @@ class StreamlitAppTests(unittest.TestCase):
         return app
 
     def test_navigation_only_has_v1_pages(self):
-        self.assertEqual(app_module.APP_VERSION, "1.0.5")
+        self.assertEqual(app_module.APP_VERSION, "1.1")
         self.assertTrue(app_module.PUBLIC_MODE)
         self.assertEqual(app_module.PAGES, ("股票研究", "我的清單"))
         app = self.make_app()
@@ -149,13 +196,86 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                button.label == "連網產生研究建議"
+                button.label == "連網產生初步研究卡"
                 for button in app.button
             )
         )
         self.assertTrue(
             any("2308" in item.value for item in app.subheader)
         )
+
+    def test_new_stock_candidate_renders_initial_research_card(self):
+        with temporary_project_candidates([candidate_record()]):
+            app = self.make_app()
+            app.text_input[0].input("2317").run()
+            self.assertFalse(app.exception)
+            self.assertTrue(
+                any("2317" in item.value for item in app.subheader)
+            )
+            self.assertTrue(
+                any(
+                    "尚未建立正式研究資料" in item.value
+                    for item in app.info
+                )
+            )
+            self.assertIn(
+                "公司定位",
+                "\n".join(item.value for item in app.markdown),
+            )
+            metrics = {metric.label: metric.value for metric in app.metric}
+            self.assertEqual(metrics["總分"], "79")
+            self.assertEqual(metrics["信心等級"], "中")
+            self.assertTrue(
+                {
+                    "產業地位建議",
+                    "成長性建議",
+                    "AI 長期受益建議",
+                    "估值合理性建議",
+                    "股價與籌碼風險建議",
+                }.issubset(metrics)
+            )
+            self.assertFalse(
+                any(
+                    button.label == "加入正式研究資料庫"
+                    for button in app.button
+                )
+            )
+
+    def test_private_candidate_shows_formal_database_button(self):
+        with (
+            temporary_public_mode(False),
+            temporary_project_candidates([candidate_record()]),
+        ):
+            app = self.make_app()
+            app.text_input[0].input("2317").run()
+            self.assertFalse(app.exception)
+            self.assertTrue(
+                any(
+                    button.label == "加入正式研究資料庫"
+                    for button in app.button
+                )
+            )
+
+    def test_watchlist_page_renders_candidate_research(self):
+        rows = [
+            {
+                "stock_id": "2317",
+                "stock_name": "鴻海",
+                "added_at": "2026-07-03T10:00:00+08:00",
+                "note": "候選研究",
+            }
+        ]
+        with (
+            temporary_public_mode(False),
+            temporary_project_watchlist(rows),
+            temporary_project_candidates([candidate_record()]),
+        ):
+            app = self.make_app()
+            app.selectbox[0].select("我的清單").run()
+            self.assertFalse(app.exception)
+            table = app.dataframe[0].value
+            self.assertEqual(str(table.iloc[0]["股票代號"]), "2317")
+            self.assertEqual(table.iloc[0]["研究決策"], "續列觀察")
 
     def test_summary_shows_no_network_update_without_suggestion(self):
         app = self.make_app()
@@ -428,6 +548,34 @@ class WatchlistWorkflowTests(unittest.TestCase):
         self.assertEqual(missing["industry_score"], "尚未建立研究資料")
         self.assertEqual(missing["research_decision"], "尚未建立研究資料")
 
+    def test_watchlist_view_uses_candidate_for_new_stock(self):
+        watchlist = pd.DataFrame(
+            [
+                {
+                    "stock_id": "2317",
+                    "stock_name": "鴻海",
+                    "added_at": "2026-07-03T10:00:00+08:00",
+                    "note": "候選研究",
+                }
+            ],
+            columns=app_module.WATCHLIST_COLUMNS,
+        )
+        summary = app_module.load_decision_summary(
+            str(PROJECT_DIR / "decision_summary.csv"),
+            (PROJECT_DIR / "decision_summary.csv").stat().st_mtime_ns,
+        )
+        candidates = pd.DataFrame(
+            [candidate_record()],
+            columns=app_module.CANDIDATE_COLUMNS,
+        )
+        view = app_module.build_watchlist_view(
+            watchlist,
+            summary,
+            candidates,
+        )
+        self.assertEqual(view.iloc[0]["research_decision"], "續列觀察")
+        self.assertEqual(view.iloc[0]["industry_score"], 21)
+
     def test_new_stock_network_research_creates_suggested_csv(self):
         with temporary_public_mode(True), TemporaryDirectory() as temporary_dir:
             temp_dir = Path(temporary_dir)
@@ -495,6 +643,53 @@ class WatchlistWorkflowTests(unittest.TestCase):
             self.assertEqual(original, backup.read_bytes())
             self.assertTrue(summary_path.exists())
 
+    def test_private_mode_can_promote_confirmed_candidate(self):
+        with temporary_public_mode(False), TemporaryDirectory() as temporary_dir:
+            temp_dir = Path(temporary_dir)
+            stocks_path = temp_dir / "stocks.csv"
+            candidates_path = temp_dir / "research_candidates.csv"
+            summary_path = temp_dir / "decision_summary.csv"
+            stocks_path.write_bytes((PROJECT_DIR / "stocks.csv").read_bytes())
+            pd.DataFrame(
+                [candidate_record()],
+                columns=app_module.CANDIDATE_COLUMNS,
+            ).to_csv(
+                candidates_path,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            original = pd.read_csv(
+                stocks_path,
+                dtype=str,
+                encoding="utf-8-sig",
+                keep_default_na=False,
+            )
+
+            backup = app_module.promote_candidate_to_stocks(
+                "2317",
+                stocks_path=stocks_path,
+                candidates_path=candidates_path,
+                summary_path=summary_path,
+                score_script=PROJECT_DIR / "score_stocks.py",
+                now=datetime(2026, 7, 3, 10, 30, 0),
+            )
+
+            updated = pd.read_csv(
+                stocks_path,
+                dtype=str,
+                encoding="utf-8-sig",
+                keep_default_na=False,
+            )
+            self.assertEqual(len(updated), len(original) + 1)
+            self.assertEqual(
+                updated.loc[updated["stock_id"] == "2317"].iloc[0][
+                    "stock_name"
+                ],
+                "鴻海",
+            )
+            self.assertEqual(backup.read_bytes(), (PROJECT_DIR / "stocks.csv").read_bytes())
+            self.assertTrue(summary_path.exists())
+
     def test_public_mode_watchlist_is_session_only(self):
         with temporary_public_mode(True), temporary_project_watchlist([]):
             watchlist_path = PROJECT_DIR / "watchlist.csv"
@@ -547,6 +742,28 @@ class WatchlistWorkflowTests(unittest.TestCase):
                 list(temp_dir.glob("stocks_backup_*.csv")),
                 [],
             )
+
+            candidates_path = temp_dir / "research_candidates.csv"
+            pd.DataFrame(
+                [candidate_record()],
+                columns=app_module.CANDIDATE_COLUMNS,
+            ).to_csv(
+                candidates_path,
+                index=False,
+                encoding="utf-8-sig",
+            )
+            with self.assertRaisesRegex(
+                app_module.CandidatePromotionError,
+                "公開部署模式不允許修改 stocks.csv",
+            ):
+                app_module.promote_candidate_to_stocks(
+                    "2317",
+                    stocks_path=stocks_path,
+                    candidates_path=candidates_path,
+                    summary_path=temp_dir / "candidate_summary.csv",
+                    score_script=PROJECT_DIR / "score_stocks.py",
+                )
+            self.assertEqual(original, stocks_path.read_bytes())
 
 
 if __name__ == "__main__":
