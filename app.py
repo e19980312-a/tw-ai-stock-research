@@ -32,10 +32,11 @@ ResearchResult = action_engine_module.ResearchResult
 decide_research = action_engine_module.decide_research
 
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.1"
 APP_DIR = Path(__file__).resolve().parent
 SUMMARY_PATH = APP_DIR / "decision_summary.csv"
 SUGGESTED_PATH = APP_DIR / "suggested_scores.csv"
+CANDIDATES_PATH = APP_DIR / "research_candidates.csv"
 STOCKS_PATH = APP_DIR / "stocks.csv"
 WATCHLIST_PATH = APP_DIR / "watchlist.csv"
 APPLY_LOG_PATH = APP_DIR / "apply_log.csv"
@@ -140,6 +141,39 @@ SUGGESTED_SCORE_COLUMNS = [
     "suggested_ai_score",
     "suggested_valuation_score",
     "suggested_price_risk_score",
+]
+
+CANDIDATE_COLUMNS = [
+    "generated_at",
+    "stock_id",
+    "stock_name",
+    "market",
+    "industry_position",
+    "ai_relevance",
+    "is_bottleneck",
+    "industry_score",
+    "growth_score",
+    "ai_score",
+    "valuation_score",
+    "price_risk_score",
+    "total_score",
+    "research_decision",
+    "research_signal",
+    "signal_strength",
+    "research_reason",
+    "risk_notes",
+    "research_note",
+    "confidence_level",
+    "source_urls",
+]
+
+CANDIDATE_SCORE_COLUMNS = [
+    "industry_score",
+    "growth_score",
+    "ai_score",
+    "valuation_score",
+    "price_risk_score",
+    "total_score",
 ]
 
 CURRENT_SCORE_COLUMNS = [
@@ -353,6 +387,29 @@ def load_suggested_scores(path_text: str, modified_ns: int) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_research_candidates(
+    path_text: str,
+    modified_ns: int,
+) -> pd.DataFrame:
+    del modified_ns
+    frame = pd.read_csv(
+        Path(path_text),
+        dtype=str,
+        encoding="utf-8-sig",
+        keep_default_na=False,
+    )
+    missing = [column for column in CANDIDATE_COLUMNS if column not in frame]
+    if missing:
+        raise ValueError(
+            f"research_candidates.csv 缺少欄位：{', '.join(missing)}"
+        )
+    frame = frame[CANDIDATE_COLUMNS].copy()
+    for column in CANDIDATE_SCORE_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+@st.cache_data(show_spinner=False)
 def load_stocks(path_text: str, modified_ns: int) -> pd.DataFrame:
     del modified_ns
     frame = pd.read_csv(
@@ -421,6 +478,7 @@ def load_apply_log(path_text: str, modified_ns: int) -> pd.DataFrame:
 def clear_data_caches() -> None:
     load_decision_summary.clear()
     load_suggested_scores.clear()
+    load_research_candidates.clear()
     load_stocks.clear()
     load_watchlist.clear()
     load_apply_log.clear()
@@ -471,6 +529,10 @@ class ResearchFetchError(RuntimeError):
 
 class WatchlistError(RuntimeError):
     """我的清單無法安全更新。"""
+
+
+class CandidatePromotionError(RuntimeError):
+    """候選研究資料無法安全加入正式研究庫。"""
 
 
 def _read_watchlist_csv(path: Path) -> pd.DataFrame:
@@ -624,6 +686,7 @@ def generate_research_suggestion(
     *,
     stocks_path: Path = STOCKS_PATH,
     suggested_path: Path = SUGGESTED_PATH,
+    candidates_path: Path = CANDIDATES_PATH,
     fetch_script: Path = FETCH_SCRIPT,
     runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -651,6 +714,8 @@ def generate_research_suggestion(
                     str(safe_stocks_path),
                     "--output",
                     str(suggested_path),
+                    "--candidates",
+                    str(candidates_path),
                 )
         except OSError as exc:
             raise ResearchFetchError(
@@ -664,6 +729,8 @@ def generate_research_suggestion(
             str(stocks_path),
             "--output",
             str(suggested_path),
+            "--candidates",
+            str(candidates_path),
         )
     after_hash = file_hash(stocks_path)
     if before_hash != after_hash:
@@ -1011,6 +1078,179 @@ def apply_suggestion_to_stocks(
                     temporary_path.unlink()
 
 
+def candidate_research_role(row: pd.Series) -> str:
+    industry_position = str(row.get("industry_position", ""))
+    ai_relevance = str(row.get("ai_relevance", ""))
+    total_score = pd.to_numeric(row.get("total_score"), errors="coerce")
+    if "景氣循環" in industry_position:
+        return "景氣循環觀察"
+    if ai_relevance == "高" and not pd.isna(total_score) and total_score >= 75:
+        return "高關注標的"
+    if ai_relevance == "低":
+        return "非主線觀察"
+    return "觀察標的"
+
+
+def promote_candidate_to_stocks(
+    stock_id: str,
+    *,
+    stocks_path: Path = STOCKS_PATH,
+    candidates_path: Path = CANDIDATES_PATH,
+    summary_path: Path = SUMMARY_PATH,
+    score_script: Path = SCORE_SCRIPT,
+    now: datetime | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+) -> Path:
+    """人工確認後將單一候選加入 stocks.csv 並重新評分。"""
+
+    if PUBLIC_MODE:
+        raise CandidatePromotionError(
+            "公開部署模式不允許修改 stocks.csv。"
+        )
+
+    target_id = stock_id.strip()
+    if not target_id:
+        raise CandidatePromotionError("stock_id 不得空白")
+
+    try:
+        stocks = _load_apply_csv(stocks_path, "stocks.csv")
+        candidates = _load_apply_csv(
+            candidates_path,
+            "research_candidates.csv",
+        )
+    except SuggestionApplyError as exc:
+        raise CandidatePromotionError(str(exc)) from exc
+    matches = candidates.loc[
+        candidates["stock_id"].astype(str).str.strip() == target_id
+    ]
+    if len(matches) != 1:
+        raise CandidatePromotionError(
+            f"research_candidates.csv 必須恰好有一筆 stock_id={target_id}"
+        )
+    if target_id in set(stocks["stock_id"].astype(str).str.strip()):
+        raise CandidatePromotionError("此股票已存在正式研究資料庫")
+
+    candidate = matches.iloc[0]
+    ai_relevance = str(candidate["ai_relevance"]).strip()
+    is_bottleneck = str(candidate["is_bottleneck"]).strip()
+    if ai_relevance not in {"高", "中", "低"}:
+        raise CandidatePromotionError(
+            "AI 相關性尚未判定，請人工補充後再加入正式研究資料庫"
+        )
+    if is_bottleneck not in {"是", "否", "部分"}:
+        raise CandidatePromotionError(
+            "瓶頸環節尚未判定，請人工補充後再加入正式研究資料庫"
+        )
+
+    score_values: dict[str, str] = {}
+    for column in CURRENT_SCORE_COLUMNS:
+        raw = str(candidate.get(column, "")).strip()
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise CandidatePromotionError(f"{column} 不是有效分數") from exc
+        maximum = SCORE_LIMITS[column]
+        if not math.isfinite(value) or not 0 <= value <= maximum:
+            raise CandidatePromotionError(
+                f"{column} 必須介於 0–{maximum:g}"
+            )
+        score_values[column] = f"{value:g}"
+
+    generated_at = str(candidate["generated_at"]).strip()
+    try:
+        data_date = datetime.fromisoformat(generated_at).date().isoformat()
+    except ValueError as exc:
+        raise CandidatePromotionError("generated_at 格式不正確") from exc
+    source_urls = str(candidate.get("source_urls", "")).split(" | ")
+    source = next((url.strip() for url in source_urls if url.strip()), "")
+
+    new_row = {
+        "data_date": data_date,
+        "stock_id": target_id,
+        "stock_name": str(candidate["stock_name"]).strip(),
+        "industry_position": str(candidate["industry_position"]).strip(),
+        "ai_relevance": ai_relevance,
+        "is_bottleneck": is_bottleneck,
+        "risk_notes": str(candidate["risk_notes"]).strip(),
+        "research_role": candidate_research_role(candidate),
+        "research_note": str(candidate["research_note"]).strip(),
+        **score_values,
+        "source": source,
+    }
+    updated = pd.concat(
+        [
+            stocks,
+            pd.DataFrame([new_row], columns=stocks.columns),
+        ],
+        ignore_index=True,
+    )
+
+    operation_time = now or datetime.now().astimezone()
+    backup_path = stocks_path.with_name(
+        f"stocks_backup_{operation_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    )
+    if backup_path.exists():
+        raise CandidatePromotionError(
+            f"備份檔已存在：{backup_path.name}，請稍後再試"
+        )
+    try:
+        shutil.copy2(stocks_path, backup_path)
+    except OSError as exc:
+        raise CandidatePromotionError(f"無法建立備份：{exc}") from exc
+
+    temporary_stocks: Path | None = None
+    temporary_summary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            prefix=".candidate_stocks_",
+            suffix=".csv",
+            dir=stocks_path.parent,
+            delete=False,
+        ) as handle:
+            temporary_stocks = Path(handle.name)
+            updated.to_csv(handle, index=False, lineterminator="\n")
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".candidate_summary_",
+            suffix=".csv",
+            dir=summary_path.parent,
+            delete=False,
+        ) as handle:
+            temporary_summary = Path(handle.name)
+
+        score_runner = runner or run_script
+        completed = score_runner(
+            score_script,
+            "--input",
+            str(temporary_stocks),
+            "--output",
+            str(temporary_summary),
+        )
+        if completed.returncode != 0:
+            raise CandidatePromotionError(
+                f"重新評分失敗：{process_error(completed)}"
+            )
+        if temporary_summary.stat().st_size == 0:
+            raise CandidatePromotionError("重新評分未產生有效摘要")
+
+        os.replace(temporary_stocks, stocks_path)
+        temporary_stocks = None
+        os.replace(temporary_summary, summary_path)
+        temporary_summary = None
+        return backup_path
+    except Exception as exc:
+        if isinstance(exc, CandidatePromotionError):
+            raise
+        raise CandidatePromotionError(f"加入正式研究資料庫失敗：{exc}") from exc
+    finally:
+        for temporary_path in (temporary_stocks, temporary_summary):
+            if temporary_path and temporary_path.exists():
+                temporary_path.unlink()
+
+
 def read_decision_frame() -> pd.DataFrame | None:
     if not SUMMARY_PATH.exists():
         st.error("找不到 decision_summary.csv，請先重新產生摘要。")
@@ -1035,6 +1275,19 @@ def read_suggested_frame() -> pd.DataFrame | None:
         )
     except (OSError, ValueError, pd.errors.ParserError) as exc:
         st.error(f"無法讀取 suggested_scores.csv：{exc}")
+        return None
+
+
+def read_candidates_frame() -> pd.DataFrame | None:
+    if not CANDIDATES_PATH.exists():
+        return pd.DataFrame(columns=CANDIDATE_COLUMNS)
+    try:
+        return load_research_candidates(
+            str(CANDIDATES_PATH),
+            CANDIDATES_PATH.stat().st_mtime_ns,
+        )
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        st.error(f"無法讀取 research_candidates.csv：{exc}")
         return None
 
 
@@ -1168,8 +1421,9 @@ def research_signal_label(value: object) -> str:
 def build_watchlist_view(
     watchlist: pd.DataFrame,
     summary: pd.DataFrame,
+    candidates: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """以我的清單為主表，補上現有研究摘要。"""
+    """以我的清單為主表，優先補正式摘要，再補候選研究。"""
 
     research_columns = [
         "stock_id",
@@ -1186,8 +1440,44 @@ def build_watchlist_view(
         "ai_relevance",
         "data_date",
     ]
-    research = summary[research_columns].copy().rename(
+    research = summary[research_columns].copy()
+    research["_priority"] = 0
+    if candidates is not None and not candidates.empty:
+        candidate_research = candidates[
+            [
+                "stock_id",
+                "stock_name",
+                "total_score",
+                "industry_score",
+                "growth_score",
+                "ai_score",
+                "valuation_score",
+                "price_risk_score",
+                "research_decision",
+                "research_signal",
+                "signal_strength",
+                "ai_relevance",
+                "generated_at",
+            ]
+        ].copy()
+        candidate_research["data_date"] = (
+            candidate_research["generated_at"].astype(str).str.slice(0, 10)
+        )
+        candidate_research = candidate_research.drop(
+            columns=["generated_at"]
+        )
+        candidate_research["_priority"] = 1
+        research = pd.concat(
+            [research, candidate_research],
+            ignore_index=True,
+        )
+    research = (
+        research.sort_values("_priority", kind="stable")
+        .drop_duplicates("stock_id", keep="first")
+        .drop(columns=["_priority"])
+        .rename(
         columns={"stock_name": "research_stock_name"}
+        )
     )
     merged = watchlist.merge(
         research,
@@ -1327,41 +1617,48 @@ def render_stock_detail(
 def render_research_summary(
     local_row: pd.Series | None,
     suggestion_row: pd.Series | None,
+    candidate_row: pd.Series | None = None,
 ) -> None:
     """將本地研究結論與連網信心等級合併為單一摘要卡。"""
 
+    research_row = local_row if local_row is not None else candidate_row
     with st.container(border=True):
         data_date = (
-            local_row["data_date"] if local_row is not None else "尚未建立研究資料"
+            research_row.get("data_date")
+            or str(research_row.get("generated_at", ""))[:10]
+            if research_row is not None
+            else "尚未建立研究資料"
         )
         total_score = (
-            format_score(local_row["total_score"])
-            if local_row is not None
+            format_score(research_row["total_score"])
+            if research_row is not None
             else "—"
         )
         confidence_level = (
-            suggestion_row["confidence_level"] or "—"
+            candidate_row["confidence_level"] or "—"
+            if candidate_row is not None
+            else suggestion_row["confidence_level"] or "—"
             if suggestion_row is not None
             else "尚未連網更新"
         )
         signal_strength = (
-            local_row["signal_strength"] or "—"
-            if local_row is not None
+            research_row["signal_strength"] or "—"
+            if research_row is not None
             else "—"
         )
         research_decision = (
-            local_row["research_decision"] or "尚未建立研究資料"
-            if local_row is not None
+            research_row["research_decision"] or "尚未建立研究資料"
+            if research_row is not None
             else "尚未建立研究資料"
         )
         research_signal = (
-            research_signal_label(local_row["research_signal"])
-            if local_row is not None
+            research_signal_label(research_row["research_signal"])
+            if research_row is not None
             else "—"
         )
         research_reason = (
-            local_row["research_reason"] or "尚未建立研究資料"
-            if local_row is not None
+            research_row["research_reason"] or "尚未建立研究資料"
+            if research_row is not None
             else "尚未建立研究資料"
         )
 
@@ -1759,6 +2056,23 @@ def render_stock_research_page() -> None:
     if watchlist is None:
         return
 
+    candidates = read_candidates_frame()
+    if candidates is None:
+        return
+    candidate_row: pd.Series | None = None
+    if local_row is None and not candidates.empty:
+        candidate_matches = find_stock_matches(candidates, query)
+        if (
+            len(candidate_matches) != 1
+            and st.session_state.get("last_research_query") == query
+        ):
+            candidate_matches = find_exact_stock(
+                candidates,
+                st.session_state.get("last_research_stock_id", ""),
+            )
+        if len(candidate_matches) == 1:
+            candidate_row = candidate_matches.iloc[0]
+
     suggestions = read_suggested_frame()
     suggestion_row: pd.Series | None = None
     if suggestions is not None and not suggestions.empty:
@@ -1780,7 +2094,13 @@ def render_stock_research_page() -> None:
         if len(suggestion_matches) == 1:
             suggestion_row = suggestion_matches.iloc[0]
 
-    display_row = local_row if local_row is not None else suggestion_row
+    display_row = (
+        local_row
+        if local_row is not None
+        else candidate_row
+        if candidate_row is not None
+        else suggestion_row
+    )
     if display_row is not None:
         render_watchlist_control(
             str(display_row["stock_id"]),
@@ -1791,7 +2111,7 @@ def render_stock_research_page() -> None:
     fetch_label = (
         "連網更新研究建議"
         if local_row is not None
-        else "連網產生研究建議"
+        else "連網產生初步研究卡"
     )
     fetch_query = (
         str(local_row["stock_id"]) if local_row is not None else query
@@ -1808,6 +2128,7 @@ def render_stock_research_page() -> None:
             st.error(str(exc))
         else:
             load_suggested_scores.clear()
+            load_research_candidates.clear()
             st.session_state["last_research_query"] = query
             st.session_state["last_research_stock_id"] = (
                 fetched_stock_id(completed) or fetch_query
@@ -1817,12 +2138,46 @@ def render_stock_research_page() -> None:
             )
             st.rerun()
 
-    if local_row is None:
-        st.info("本地研究資料尚未建立，可使用連網研究產生建議分數")
+    if local_row is None and candidate_row is None:
+        st.info("本地研究資料尚未建立")
+    elif local_row is None:
+        st.info(
+            "尚未建立正式研究資料，以下為連網產生的初步研究結果，請人工確認。"
+        )
+        if PUBLIC_MODE:
+            st.caption("公開版操作不會永久保存")
 
-    render_research_summary(local_row, suggestion_row)
-    if local_row is not None:
-        render_research_context(local_row)
+    research_row = local_row if local_row is not None else candidate_row
+    if research_row is not None:
+        render_research_summary(
+            local_row,
+            suggestion_row,
+            candidate_row,
+        )
+        render_research_context(research_row)
+    if candidate_row is not None and not PUBLIC_MODE:
+        st.warning(
+            "請先人工確認公司定位、風險與五項分數，再加入正式研究資料庫。"
+        )
+        if st.button(
+            "加入正式研究資料庫",
+            type="primary",
+            width="stretch",
+        ):
+            try:
+                with st.spinner("正在備份股票池並建立正式研究資料…"):
+                    backup_path = promote_candidate_to_stocks(
+                        str(candidate_row["stock_id"])
+                    )
+            except CandidatePromotionError as exc:
+                st.error(str(exc))
+            else:
+                clear_data_caches()
+                st.session_state["research_page_message"] = (
+                    f"{candidate_row['stock_id']} {candidate_row['stock_name']} "
+                    f"已加入正式研究資料庫；備份檔：{backup_path.name}。"
+                )
+                st.rerun()
     if suggestion_row is None:
         st.caption("尚未產生這檔股票的連網研究建議。")
     else:
@@ -1845,8 +2200,11 @@ def render_watchlist_page() -> None:
     summary = read_decision_frame()
     if summary is None:
         return
+    candidates = read_candidates_frame()
+    if candidates is None:
+        return
 
-    view = build_watchlist_view(watchlist, summary)
+    view = build_watchlist_view(watchlist, summary, candidates)
     query = st.text_input(
         "搜尋我的清單",
         placeholder="輸入股票代號、名稱或部分關鍵字",

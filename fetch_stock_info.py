@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""台股 AI 選股監控 v0.5：抓取公開資料並產生建議分數。"""
+"""台股 AI 研究工具 v1.1：抓取建議分數與新股票初步研究卡。"""
 
 from __future__ import annotations
 
@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
+from action_engine import decide_research
 
-VERSION = "0.5.1"
+
+VERSION = "1.1"
 
 TWSE_COMPANY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TWSE_REVENUE_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
@@ -64,6 +66,30 @@ OUTPUT_FIELDS = (
     "price_risk_reason",
     "raw_metrics_summary",
     "source_count",
+    "source_urls",
+)
+
+CANDIDATE_FIELDS = (
+    "generated_at",
+    "stock_id",
+    "stock_name",
+    "market",
+    "industry_position",
+    "ai_relevance",
+    "is_bottleneck",
+    "industry_score",
+    "growth_score",
+    "ai_score",
+    "valuation_score",
+    "price_risk_score",
+    "total_score",
+    "research_decision",
+    "research_signal",
+    "signal_strength",
+    "research_reason",
+    "risk_notes",
+    "research_note",
+    "confidence_level",
     "source_urls",
 )
 
@@ -113,6 +139,15 @@ class CompanyMatch:
     market: str
     record: dict[str, Any]
     local: LocalStock | None
+
+
+@dataclass(frozen=True)
+class InferredContext:
+    industry_position: str
+    ai_relevance: str
+    is_bottleneck: str
+    risk_notes: str
+    research_note: str
 
 
 def http_get(url: str, timeout: int) -> bytes:
@@ -404,14 +439,115 @@ def find_ai_keywords(text: str) -> list[str]:
     ]
 
 
-def suggest_industry_score(local: LocalStock | None) -> int:
-    if local is None:
+def infer_research_context(text: str) -> InferredContext:
+    folded = text.casefold()
+
+    def contains_any(keywords: Iterable[str]) -> bool:
+        return any(keyword.casefold() in folded for keyword in keywords)
+
+    if contains_any(
+        (
+            "ai伺服器",
+            "ai server",
+            "odm",
+            "伺服器",
+            "雲端資料中心",
+            "資料中心",
+        )
+    ):
+        return InferredContext(
+            "AI 伺服器、ODM 與雲端資料中心供應鏈",
+            "高",
+            "部分",
+            "客戶集中、雲端資本支出循環與新平台量產執行風險",
+            "初步判定為 AI 伺服器／資料中心受益標的，需人工確認產品組合與客戶結構",
+        )
+
+    if contains_any(("cpo", "矽光子", "800g", "1.6t")):
+        return InferredContext(
+            "高速光通訊、矽光子與 CPO 供應鏈",
+            "高",
+            "部分",
+            "技術認證、量產良率、客戶導入進度與高速規格迭代風險",
+            "初步判定為高速光通訊主線，需人工確認產品規格、量產進度與 AI 營收占比",
+        )
+
+    if contains_any(("光通訊", "光收發", "光模組", "雷射", "光電")):
+        return InferredContext(
+            "光通訊與高速傳輸供應鏈",
+            "中",
+            "部分",
+            "需求能見度、產品認證、良率與終端客戶拉貨波動",
+            "具光通訊題材，需人工確認是否直接受益於 AI 資料中心升級",
+        )
+
+    if contains_any(("abf", "ccl", "銅箔基板", "高速材料")):
+        return InferredContext(
+            "高速材料、CCL 與先進載板供應鏈",
+            "高",
+            "部分",
+            "原料價格、產品組合、認證週期與高階產能利用率風險",
+            "初步判定受益於高速運算材料升級，需人工確認高階產品占比",
+        )
+
+    if contains_any(("pcb", "印刷電路板", "載板")):
+        return InferredContext(
+            "PCB 與電子材料供應鏈",
+            "中",
+            "部分",
+            "終端需求、產品組合、原料價格與產能利用率風險",
+            "具 PCB 供應鏈題材，需人工確認高速運算產品與 AI 客戶占比",
+        )
+
+    if contains_any(("dram", "nand", "記憶體")):
+        return InferredContext(
+            "DRAM、NAND 與記憶體景氣循環供應鏈",
+            "中",
+            "否",
+            "記憶體價格、庫存調整、資本支出與景氣循環波動",
+            "列為景氣循環觀察，需追蹤報價、庫存與 AI 伺服器需求外溢",
+        )
+
+    if contains_any(("被動元件", "電源", "工業電腦", "ipc")):
+        return InferredContext(
+            "電子零組件、電源或工業電腦供應鏈",
+            "中",
+            "否",
+            "終端需求、庫存循環、產品組合與同業競爭風險",
+            "AI 受益程度可能較間接，需人工確認資料中心或高階應用營收占比",
+        )
+
+    if contains_any(("ai", "人工智慧", "hpc", "高速運算")):
+        return InferredContext(
+            "AI 相關電子製造與運算供應鏈",
+            "中",
+            "部分",
+            "AI 題材與實際營收貢獻可能有落差；需確認客戶、產品組合與量產進度",
+            "公開資訊已出現 AI／高速運算關鍵字，初步列為 AI 相關供應鏈並等待人工確認",
+        )
+
+    return InferredContext(
+        "產業位置待人工確認",
+        "未判定",
+        "未判定",
+        "資料不足，需人工確認",
+        "公開資料尚不足以完成產業與 AI 定位，請補充公司產品、客戶與競爭地位",
+    )
+
+
+def suggest_industry_score(
+    local: LocalStock | None,
+    inferred: InferredContext | None = None,
+) -> int:
+    if local is None and inferred is None:
         return 15
+    bottleneck = local.is_bottleneck if local else inferred.is_bottleneck
+    relevance = local.ai_relevance if local else inferred.ai_relevance
     score = {"是": 23, "部分": 19, "否": 14}.get(
-        local.is_bottleneck,
+        bottleneck,
         15,
     )
-    score += {"高": 2, "中": 1, "低": 0}.get(local.ai_relevance, 0)
+    score += {"高": 2, "中": 1, "低": 0}.get(relevance, 0)
     return min(25, score)
 
 
@@ -445,8 +581,13 @@ def suggest_growth_score(
 def suggest_ai_score(
     local: LocalStock | None,
     keyword_count: int,
+    inferred: InferredContext | None = None,
 ) -> int:
-    relevance = local.ai_relevance if local else ""
+    relevance = (
+        local.ai_relevance
+        if local
+        else inferred.ai_relevance if inferred else ""
+    )
     base = {"高": 14, "中": 9, "低": 4}.get(relevance, 6)
     return min(20, base + min(keyword_count, 6))
 
@@ -545,11 +686,18 @@ def determine_confidence(
 def make_industry_reason(
     local: LocalStock | None,
     score: int,
+    inferred: InferredContext | None = None,
 ) -> str:
-    if local is None:
+    if local is None and inferred is None:
         return (
             f"stocks.csv 無既有產業定位與瓶頸標記，採中性 {score}/25；"
             "需人工確認產業地位。"
+        )
+    if local is None:
+        return (
+            f"依公開文字初步判定「{inferred.industry_position}」，"
+            f"瓶頸環節為「{inferred.is_bottleneck}」、AI 相關性為"
+            f"「{inferred.ai_relevance}」，建議 {score}/25；需人工確認。"
         )
     return (
         f"瓶頸環節標記為「{local.is_bottleneck or '未填'}」，"
@@ -583,8 +731,13 @@ def make_ai_reason(
     local: LocalStock | None,
     keywords: list[str],
     score: int,
+    inferred: InferredContext | None = None,
 ) -> str:
-    relevance = local.ai_relevance if local else "未評"
+    relevance = (
+        local.ai_relevance
+        if local
+        else inferred.ai_relevance if inferred else "未評"
+    )
     if not keywords:
         return (
             f"既有 AI 相關性為「{relevance}」，公開文字未偵測到明確 "
@@ -677,6 +830,7 @@ def build_suggestion(
     news: list[dict[str, str]],
     warnings: list[str],
     source_urls: list[str],
+    inferred: InferredContext | None = None,
 ) -> dict[str, str | int]:
     local_text = ""
     if match.local:
@@ -691,12 +845,12 @@ def build_suggestion(
     news_text = " ".join(item["title"] for item in news)
     keywords = find_ai_keywords(f"{local_text} {basic_text} {news_text}")
 
-    industry_score = suggest_industry_score(match.local)
+    industry_score = suggest_industry_score(match.local, inferred)
     growth_score = suggest_growth_score(
         revenue["monthly_yoy"],
         revenue["cumulative_yoy"],
     )
-    ai_score = suggest_ai_score(match.local, len(keywords))
+    ai_score = suggest_ai_score(match.local, len(keywords), inferred)
     valuation_score = suggest_valuation_score(
         valuation["pe_ratio"],
         growth_score,
@@ -768,11 +922,17 @@ def build_suggestion(
         "industry_reason": make_industry_reason(
             match.local,
             industry_score,
+            inferred,
         ),
         "suggested_growth_score": growth_score,
         "growth_reason": make_growth_reason(revenue, growth_score),
         "suggested_ai_score": ai_score,
-        "ai_reason": make_ai_reason(match.local, keywords, ai_score),
+        "ai_reason": make_ai_reason(
+            match.local,
+            keywords,
+            ai_score,
+            inferred,
+        ),
         "suggested_valuation_score": valuation_score,
         "valuation_reason": make_valuation_reason(
             valuation["pe_ratio"],
@@ -788,6 +948,91 @@ def build_suggestion(
         "source_count": len(all_urls),
         "source_urls": " | ".join(all_urls),
     }
+
+
+def build_candidate(
+    suggestion: dict[str, str | int],
+    *,
+    market: str,
+    inferred: InferredContext,
+) -> dict[str, str | int]:
+    scores = {
+        "industry_score": int(suggestion["suggested_industry_score"]),
+        "growth_score": int(suggestion["suggested_growth_score"]),
+        "ai_score": int(suggestion["suggested_ai_score"]),
+        "valuation_score": int(suggestion["suggested_valuation_score"]),
+        "price_risk_score": int(
+            suggestion["suggested_price_risk_score"]
+        ),
+    }
+    total_score = sum(scores.values())
+    confidence = str(suggestion["confidence_level"])
+    if (
+        inferred.ai_relevance == "未判定"
+        or inferred.is_bottleneck == "未判定"
+    ):
+        confidence = "低"
+
+    risk_notes = inferred.risk_notes
+    if confidence == "低" and "資料不足，需人工確認" not in risk_notes:
+        risk_notes = f"{risk_notes}；資料不足，需人工確認"
+
+    research = decide_research(
+        total_score=float(total_score),
+        valuation_score=float(scores["valuation_score"]),
+        price_risk_score=float(scores["price_risk_score"]),
+        ai_relevance=inferred.ai_relevance,
+        confidence_level=confidence,
+    )
+    return {
+        "generated_at": suggestion["generated_at"],
+        "stock_id": suggestion["stock_id"],
+        "stock_name": suggestion["stock_name"],
+        "market": market,
+        "industry_position": inferred.industry_position,
+        "ai_relevance": inferred.ai_relevance,
+        "is_bottleneck": inferred.is_bottleneck,
+        **scores,
+        "total_score": total_score,
+        **research.as_dict(),
+        "risk_notes": risk_notes,
+        "research_note": inferred.research_note,
+        "confidence_level": confidence,
+        "source_urls": suggestion["source_urls"],
+    }
+
+
+def write_candidates(
+    rows: Iterable[dict[str, str | int]],
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CANDIDATE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def upsert_candidate(
+    candidate: dict[str, str | int],
+    path: Path,
+) -> None:
+    rows: list[dict[str, str | int]] = []
+    if path.exists():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            headers = tuple(reader.fieldnames or ())
+            if all(field in headers for field in CANDIDATE_FIELDS):
+                rows = [dict(row) for row in reader]
+
+    rows = [
+        row
+        for row in rows
+        if clean_text(row.get("stock_id")) != str(candidate["stock_id"])
+    ]
+    rows.append(candidate)
+    rows.sort(key=lambda row: clean_text(row.get("stock_id")))
+    write_candidates(rows, path)
 
 
 def write_suggestions(
@@ -876,11 +1121,14 @@ def upsert_suggestion(
     write_suggestions(rows, path)
 
 
-def fetch_suggestion(
+def fetch_research_bundle(
     query: str,
     stocks_path: Path,
     timeout: int,
-) -> dict[str, str | int]:
+) -> tuple[
+    dict[str, str | int],
+    dict[str, str | int] | None,
+]:
     warnings: list[str] = []
     twse_companies = safe_fetch_json(TWSE_COMPANY_URL, timeout, warnings)
     tpex_companies = safe_fetch_json(TPEX_COMPANY_URL, timeout, warnings)
@@ -917,6 +1165,17 @@ def fetch_suggestion(
         price_history["latest"] = fetch_tpex_price(match.stock_id, tpex_prices)
 
     news, news_url = fetch_news(match.stock_name, timeout, warnings)
+    context_text = " ".join(
+        [
+            *(clean_text(value) for value in match.record.values()),
+            *(item["title"] for item in news),
+        ]
+    )
+    inferred = (
+        None
+        if match.local is not None
+        else infer_research_context(context_text)
+    )
 
     source_urls = [
         TWSE_COMPANY_URL if match.market == "TWSE" else TPEX_COMPANY_URL,
@@ -927,7 +1186,7 @@ def fetch_suggestion(
         price_url,
         news_url,
     ]
-    return build_suggestion(
+    suggestion = build_suggestion(
         match,
         revenue,
         valuation,
@@ -935,7 +1194,27 @@ def fetch_suggestion(
         news,
         warnings,
         source_urls,
+        inferred,
     )
+    candidate = (
+        build_candidate(
+            suggestion,
+            market=match.market,
+            inferred=inferred,
+        )
+        if inferred is not None
+        else None
+    )
+    return suggestion, candidate
+
+
+def fetch_suggestion(
+    query: str,
+    stocks_path: Path,
+    timeout: int,
+) -> dict[str, str | int]:
+    suggestion, _ = fetch_research_bundle(query, stocks_path, timeout)
+    return suggestion
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -963,6 +1242,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="建議分數輸出路徑",
     )
     parser.add_argument(
+        "--candidates",
+        type=Path,
+        default=script_dir / "research_candidates.csv",
+        help="新股票初步研究卡輸出路徑",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=20,
@@ -975,12 +1260,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     query = " ".join(args.query).strip()
     try:
-        suggestion = fetch_suggestion(
+        suggestion, candidate = fetch_research_bundle(
             query,
             args.stocks,
             max(3, args.timeout),
         )
         upsert_suggestion(suggestion, args.output)
+        if candidate is not None:
+            upsert_candidate(candidate, args.candidates)
     except (FetchError, OSError, csv.Error) as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 1
@@ -995,6 +1282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"價格風險 {suggestion['suggested_price_risk_score']}"
     )
     print(f"輸出：{args.output.resolve()}")
+    if candidate is not None:
+        print(f"候選研究：{args.candidates.resolve()}")
     print("stocks.csv 未被修改；請人工確認後再採用建議分數。")
     return 0
 

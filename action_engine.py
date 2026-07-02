@@ -37,11 +37,13 @@ def decide_research(
     price_risk_score: float | None,
     ai_relevance: str = "",
     research_role: str = "",
+    confidence_level: str = "",
 ) -> ResearchResult:
     """依公司分數、風險與研究定位產生研究輔助訊號。"""
 
     ai_relevance = str(ai_relevance).strip()
     research_role = str(research_role).strip()
+    confidence_level = str(confidence_level).strip()
 
     if (
         total_score is None
@@ -53,6 +55,21 @@ def decide_research(
             "watch",
             "弱",
             "分數資料不足，補齊研究資料後再評估",
+        )
+
+    if confidence_level == "低":
+        if total_score >= 60:
+            return ResearchResult(
+                "續列觀察",
+                "watch",
+                "弱",
+                "初步資料信心偏低，暫不列為布局候選，需人工補充與確認",
+            )
+        return ResearchResult(
+            "僅追蹤不投入",
+            "watch",
+            "弱",
+            "初步資料信心偏低且分數未達門檻，僅保留追蹤",
         )
 
     if valuation_score <= 5 and price_risk_score <= 4:
